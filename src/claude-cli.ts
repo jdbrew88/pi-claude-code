@@ -958,6 +958,7 @@ class ClaudeProcess {
     let result: NativeResult | undefined;
     let nativeError: string | undefined;
     let rateLimit: RateLimitInfo | undefined;
+    const trace: string[] = [];
 
     try {
       const frames = continuation ? input.frames.slice(-1) : input.frames;
@@ -980,6 +981,7 @@ class ClaudeProcess {
       for (;;) {
         const event = await this.queue.next(input.signal, this.timeoutMs);
         if (!event) throw await this.exitError("Claude Code exited before completing its response");
+        if (trace.length < 12) trace.push(event.type === "result" ? `result:${event.subtype ?? "?"}${event.is_error ? "!" : ""}` : event.type);
         if (event.type === "assistant") {
           const error = nativeErrorText(event);
           if (error !== undefined) nativeError = error;
@@ -1004,7 +1006,7 @@ class ClaudeProcess {
           if (this.relay.denied) detail += `, native retries denied ${this.relay.denied}`;
           const upstreamError = this.relay.errorText();
           if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
-          throw new Error(`Incomplete Claude Code upstream response (${detail})`);
+          throw new IncompleteClaudeResponse(`Incomplete Claude Code upstream response (${detail})`);
         }
         message = this.relay.capture.message;
         sawMessageStop = true;
@@ -1013,8 +1015,16 @@ class ClaudeProcess {
       }
 
       if (!message || !sawMessageStop || !result) {
-        throw new Error(
-          `Incomplete Claude Code response: assistant, message_stop and one result required${this.stderr ? ` (${this.stderr.trim().slice(-500)})` : ""}`,
+        // Keep what the child actually said: a native API error text or an event trace is the only clue
+        // when the response is incomplete (the bare message hid both in the 2026-10-26 loops).
+        const clues = [
+          nativeError ? `native error: ${nativeError.slice(0, 300)}` : "",
+          this.stderr ? this.stderr.trim().slice(-500) : "",
+          trace.length ? `events: ${trace.join(",")}` : "",
+          `relay ${this.relay.used ? `used, status ${this.relay.status ?? "unknown"}` : "unused"}`,
+        ].filter(Boolean);
+        throw new IncompleteClaudeResponse(
+          `Incomplete Claude Code response: assistant, message_stop and one result required (${clues.join("; ")})`,
         );
       }
 
@@ -1087,6 +1097,9 @@ class ClaudeProcess {
     return new Error(`${fallback} (exit ${outcome.code ?? "unknown"}${detail ? `: ${detail}` : ""})`);
   }
 }
+
+/** The child or relay ended without a complete response; the worker is unusable, a fresh one may succeed. */
+export class IncompleteClaudeResponse extends Error {}
 
 interface AcquiredProcess {
   worker: ClaudeProcess;
@@ -1196,6 +1209,22 @@ registerSessionResourceCleanup((sessionId) => {
 });
 
 export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {
+  let delivered = false;
+  const once = { ...input, onEvent: input.onEvent ? (event: AnthropicStreamEvent) => ((delivered = true), input.onEvent!(event)) : undefined };
+  try {
+    return await runClaudeRequestOnce(once);
+  } catch (error) {
+    // Never retry after events reached the caller: a replay would duplicate streamed output.
+    if (!(error instanceof IncompleteClaudeResponse) || input.signal?.aborted || delivered) throw error;
+    // runClaudeRequestOnce already tore down the child and relay. Forget cached readiness and respawn once, with a
+    // cold full replay, instead of surfacing a dead-worker error (Jean-visible loops on 2026-10-26).
+    readyStatusCache.clear();
+    await closeClaudeProcesses(input.sessionId);
+    return await runClaudeRequestOnce(input);
+  }
+}
+
+async function runClaudeRequestOnce(input: RunClaudeInput): Promise<RunClaudeOutput> {
   input.signal?.throwIfAborted();
   const plan = launchPlan(input);
   const acquired = await acquireProcess(input, plan);
