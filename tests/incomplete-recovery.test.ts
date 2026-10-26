@@ -7,7 +7,7 @@ import { cachedClaudeProcessCount, closeClaudeProcesses, runClaudeRequest } from
 
 // Fake `claude`: behaviour per spawn is chosen by a counter file. MODE=bad-first: first child answers with a result but no
 // assistant/message_stop (the "Incomplete Claude Code response" shape); later children are fine. MODE=always-bad: never fine.
-const script = `#!/usr/bin/env node
+const script = `#!${process.execPath}
 import readline from "node:readline";
 import {appendFileSync, readFileSync, existsSync} from "node:fs";
 if (process.argv.includes("auth") && process.argv.includes("status")) {
@@ -31,6 +31,7 @@ for await (const line of input) {
     await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {method: "POST", body: "{}"}).catch(() => {});
     console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue;
   }
+  if (process.env.MODE === "hold-good") await new Promise((resolve) => setTimeout(resolve, 1200));
   if (bad) { console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue; }
   for (const event of [
     {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}},
@@ -109,3 +110,21 @@ test("relay failure (unreachable upstream, AggregateError) is torn down and retr
     assert.equal(cachedClaudeProcessCount(), 0);
   } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
 });
+
+for (const failingSession of [undefined, "healthy"] as const) {
+  test(`a concurrent healthy request survives another request's incomplete-response recovery (failing sessionId ${failingSession ?? "undefined"})`, async () => {
+    const t = await setup("hold-good");
+    try {
+      let outcome: { ok: boolean; message?: string } | undefined;
+      const healthy = runClaudeRequest(t.input()).then(() => (outcome = { ok: true }), (e: Error) => (outcome = { ok: false, message: e.message }));
+      const until = Date.now() + 2000;
+      while (cachedClaudeProcessCount() !== 1 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+      assert.equal(cachedClaudeProcessCount(), 1);
+      const bad = t.input();
+      bad.env = { ...bad.env, MODE: "always-bad" };
+      await assert.rejects(runClaudeRequest({ ...bad, sessionId: failingSession } as never), /Incomplete Claude Code response/);
+      await healthy;
+      assert.deepEqual(outcome, { ok: true }, outcome?.message);
+    } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+  });
+}

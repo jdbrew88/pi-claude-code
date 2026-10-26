@@ -1216,10 +1216,10 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
   } catch (error) {
     // Never retry after events reached the caller: a replay would duplicate streamed output.
     if (!(error instanceof IncompleteClaudeResponse) || input.signal?.aborted || delivered) throw error;
-    // runClaudeRequestOnce already tore down the child and relay. Forget cached readiness and respawn once, with a
-    // cold full replay, instead of surfacing a dead-worker error (Jean-visible loops on 2026-10-26).
+    // runClaudeRequestOnce already discarded exactly its own failed worker (child, relay, cache entry); other requests'
+    // workers are untouched. Forget cached readiness and respawn once, with a cold full replay, instead of surfacing a
+    // dead-worker error (Jean-visible loops on 2026-10-26).
     readyStatusCache.clear();
-    await closeClaudeProcesses(input.sessionId);
     return await runClaudeRequestOnce(input);
   }
 }
