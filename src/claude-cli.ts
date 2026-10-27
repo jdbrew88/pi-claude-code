@@ -1135,6 +1135,11 @@ const RETRY_BASE_DELAY_MS = 1_000;
 class BufferedDelivery {
   flushed = false;
   sawToolUse = false;
+  /** Set when the caller's onEvent threw during a timer-driven flush; the attempt is then aborted with it. */
+  failure?: unknown;
+  private readonly failed = new AbortController();
+  /** Aborted (reason: the onEvent error) when a timer-driven flush fails; combined into the attempt's signal. */
+  readonly signal = this.failed.signal;
   private pending: AnthropicStreamEvent[] = [];
   private timer?: NodeJS.Timeout;
 
@@ -1145,6 +1150,7 @@ class BufferedDelivery {
 
   readonly onEvent = (event: AnthropicStreamEvent): void => {
     if (event.type === "content_block_start" && event.content_block.type === "tool_use") this.sawToolUse = true;
+    if (this.failed.signal.aborted) throw this.failure;
     if (!this.target) return;
     if (this.flushed) {
       this.target(event);
@@ -1153,7 +1159,7 @@ class BufferedDelivery {
     this.pending.push(event);
     if (event.type === "content_block_stop" || event.type === "message_stop") this.flush();
     else if (!this.timer) {
-      this.timer = setTimeout(() => this.flush(), this.holdMs);
+      this.timer = setTimeout(() => this.timerFlush(), this.holdMs);
       this.timer.unref?.();
     }
   };
@@ -1167,10 +1173,26 @@ class BufferedDelivery {
     for (const event of events) this.target(event);
   }
 
+  /** Rethrow a failure recorded by a timer-driven flush. */
+  throwIfFailed(): void {
+    if (this.failed.signal.aborted) throw this.failure;
+  }
+
   /** Drop undelivered events of a failed attempt. */
   discard(): void {
     this.cancelTimer();
     this.pending = [];
+  }
+
+  // A throw here would escape as an uncaughtException: record it and abort the attempt instead.
+  private timerFlush(): void {
+    this.timer = undefined;
+    try {
+      this.flush();
+    } catch (error) {
+      this.failure = error;
+      this.failed.abort(error);
+    }
   }
 
   private cancelTimer(): void {
@@ -1305,12 +1327,17 @@ export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaude
   const baseDelay = input.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
   for (let attempt = 1; ; attempt++) {
     const delivery = new BufferedDelivery(input.onEvent, input.deliveryBufferMs ?? DELIVERY_BUFFER_MS);
+    const signal = input.signal ? AbortSignal.any([input.signal, delivery.signal]) : delivery.signal;
     try {
-      const output = await runClaudeRequestOnce({ ...input, onEvent: delivery.onEvent });
+      const output = await runClaudeRequestOnce({ ...input, signal, onEvent: delivery.onEvent });
+      delivery.throwIfFailed();
       delivery.flush();
       return output;
-    } catch (error) {
+    } catch (caught) {
       delivery.discard();
+      // A timer-driven flush whose onEvent threw aborted this attempt: that throw is the request's failure.
+      const error = delivery.failure ?? caught;
+      if (delivery.signal.aborted) throw error;
       // Never retry after events reached the caller (a replay would duplicate streamed output), after an abort, or
       // once a tool call started. runClaudeRequestOnce already discarded exactly its own failed worker.
       if (!(error instanceof IncompleteClaudeResponse) || input.signal?.aborted || delivery.flushed || delivery.sawToolUse) {

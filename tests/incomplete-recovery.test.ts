@@ -54,6 +54,13 @@ for await (const line of input) {
     await fetch(process.env.ANTHROPIC_BASE_URL + "/v1/messages", {method: "POST", body: "{}"}).catch(() => {});
     console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue;
   }
+  if (process.env.MODE === "slow-start") {
+    // First block opens, then the child stalls well past the delivery buffer before finishing.
+    for (const event of [
+      {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}},
+      {type: "content_block_start", index: 0, content_block: {type: "text", text: ""}}]) console.log(JSON.stringify({type: "stream_event", event}));
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+  }
   if (process.env.MODE === "hold-good") await new Promise((resolve) => setTimeout(resolve, 1200));
   if (bad) { console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue; }
   for (const event of [
@@ -175,6 +182,47 @@ test("no retry after abort", async () => {
     await new Promise((r) => setTimeout(r, 300));
     controller.abort();
     await assert.rejects(run);
+    assert.equal(await t.spawns(), 1);
+  } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+test("onEvent throwing in a timer-driven flush fails that request, no uncaughtException, no retry", async () => {
+  const t = await setup("slow-start");
+  const uncaught: unknown[] = [];
+  const onUncaught = (error: unknown) => uncaught.push(error);
+  process.on("uncaughtException", onUncaught);
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      runClaudeRequest({
+        ...t.input(), deliveryBufferMs: 100,
+        onEvent: () => { throw new Error("unexpected tool from translator"); },
+      } as never),
+      /unexpected tool from translator/,
+    );
+    assert.ok(Date.now() - started < 1_400, "rejected at the flush, not after the child finished");
+    await new Promise((r) => setTimeout(r, 200));
+    assert.deepEqual(uncaught, []);
+    assert.equal(await t.spawns(), 1, "a caller-side failure is not retried");
+    assert.equal(cachedClaudeProcessCount(), 0, "the aborted worker is discarded");
+  } finally {
+    process.off("uncaughtException", onUncaught);
+    await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true });
+  }
+});
+
+test("abort during backoff sleep rejects well before retryBaseDelayMs", async () => {
+  const t = await setup("always-bad");
+  try {
+    const controller = new AbortController();
+    const run = runClaudeRequest({ ...t.input(), retryBaseDelayMs: 5_000, signal: controller.signal });
+    const until = Date.now() + 3000;
+    while ((await t.spawns()) < 1 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 300)); // first attempt has failed; now in the 5 s backoff
+    const aborted = Date.now();
+    controller.abort();
+    await assert.rejects(run);
+    assert.ok(Date.now() - aborted < 1_000, `rejected ${Date.now() - aborted} ms after abort`);
     assert.equal(await t.spawns(), 1);
   } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
 });
