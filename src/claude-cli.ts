@@ -143,10 +143,18 @@ async function captureProcess(
   child.stderr?.on("data", (chunk: string) => (stderr = (stderr + chunk).slice(-65_536)));
 
   const abort = () => killProcessTree(child);
+  let timedOut = false;
   signal?.addEventListener("abort", abort, { once: true });
-  const timer = setTimeout(abort, timeoutMs);
+  const timer = setTimeout(() => {
+    timedOut = true;
+    abort();
+  }, timeoutMs);
   try {
-    const code = await childExit(child);
+    const code = await childExit(child).catch((error: unknown) => {
+      signal?.throwIfAborted();
+      if (timedOut) throw new Error(`timed out after ${timeoutMs}ms`);
+      throw error;
+    });
     signal?.throwIfAborted();
     return { code, stdout, stderr };
   } finally {
@@ -162,26 +170,52 @@ export async function getClaudeStatus(
   const env = withConfigDirectory(envInput);
   const command = await resolveClaudeExecutable(env);
   if (!command) return { available: false, loggedIn: false, subscription: false, detail: INSTALL_HINT };
+  let result: { code: number; stdout: string; stderr: string };
   try {
-    const result = await captureProcess(command, ["auth", "status"], env, signal);
-    const payload = result.stdout.trim().startsWith("{")
-      ? (JSON.parse(result.stdout) as { loggedIn?: unknown; authMethod?: unknown; subscriptionType?: unknown })
-      : {};
-    const loggedIn = payload.loggedIn === true;
-    const plan = typeof payload.subscriptionType === "string" ? payload.subscriptionType : undefined;
-    return {
-      available: true,
-      loggedIn,
-      subscription: loggedIn && !!plan,
-      command,
-      authMethod: typeof payload.authMethod === "string" ? payload.authMethod : undefined,
-      plan,
-      detail: loggedIn ? undefined : LOGIN_HINT,
-    };
+    result = await captureProcess(command, ["auth", "status"], env, signal);
   } catch (error) {
     if (signal?.aborted) throw error;
-    return { available: true, loggedIn: false, subscription: false, command, detail: LOGIN_HINT };
+    const message = error instanceof Error ? error.message : String(error);
+    return { available: true, loggedIn: false, subscription: false, command, detail: authStatusFailure(message) };
   }
+  let payload: { loggedIn?: unknown; authMethod?: unknown; subscriptionType?: unknown } | undefined;
+  try {
+    const parsed: unknown = JSON.parse(result.stdout.trim());
+    if (parsed && typeof parsed === "object" && typeof (parsed as { loggedIn?: unknown }).loggedIn === "boolean") {
+      payload = parsed as typeof payload;
+    }
+  } catch {
+    payload = undefined;
+  }
+  // Only a parsed `loggedIn: false` means "not logged in"; anything else is a
+  // failed status check and reports the real error instead of LOGIN_HINT.
+  if (!payload) {
+    const reason =
+      result.code !== 0 ? `exit code ${result.code}` : result.stdout.trim() ? "unparseable output" : "no output";
+    const tail = (result.stderr.trim() || result.stdout.trim()).slice(-500);
+    return {
+      available: true,
+      loggedIn: false,
+      subscription: false,
+      command,
+      detail: authStatusFailure(tail ? `${reason}: ${tail}` : reason),
+    };
+  }
+  const loggedIn = payload.loggedIn === true;
+  const plan = typeof payload.subscriptionType === "string" ? payload.subscriptionType : undefined;
+  return {
+    available: true,
+    loggedIn,
+    subscription: loggedIn && !!plan,
+    command,
+    authMethod: typeof payload.authMethod === "string" ? payload.authMethod : undefined,
+    plan,
+    detail: loggedIn ? undefined : LOGIN_HINT,
+  };
+}
+
+function authStatusFailure(reason: string): string {
+  return `claude auth status failed: ${reason}`;
 }
 
 const READY_STATUS_TTL_MS = 60_000;
@@ -205,7 +239,7 @@ async function readyClaudeCommand(
   if (!status.available || !status.command) throw new Error(INSTALL_HINT);
   if (!status.loggedIn) {
     readyStatusCache.delete(key);
-    throw new Error(LOGIN_HINT);
+    throw new Error(status.detail ?? LOGIN_HINT);
   }
   readyStatusCache.set(key, { command: status.command, expires: Date.now() + READY_STATUS_TTL_MS });
   return status.command;
