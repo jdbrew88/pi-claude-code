@@ -166,21 +166,24 @@ async function captureProcess(
 export async function getClaudeStatus(
   envInput: Record<string, string | undefined> = process.env,
   signal?: AbortSignal,
+  timeoutMs = 20_000,
 ): Promise<ClaudeStatus> {
   const env = withConfigDirectory(envInput);
   const command = await resolveClaudeExecutable(env);
   if (!command) return { available: false, loggedIn: false, subscription: false, detail: INSTALL_HINT };
   let result: { code: number; stdout: string; stderr: string };
   try {
-    result = await captureProcess(command, ["auth", "status"], env, signal);
+    result = await captureProcess(command, ["auth", "status"], env, signal, timeoutMs);
   } catch (error) {
     if (signal?.aborted) throw error;
     const message = error instanceof Error ? error.message : String(error);
     return { available: true, loggedIn: false, subscription: false, command, detail: authStatusFailure(message) };
   }
   let payload: { loggedIn?: unknown; authMethod?: unknown; subscriptionType?: unknown } | undefined;
+  let parsedJson = false;
   try {
     const parsed: unknown = JSON.parse(result.stdout.trim());
+    parsedJson = true;
     if (parsed && typeof parsed === "object" && typeof (parsed as { loggedIn?: unknown }).loggedIn === "boolean") {
       payload = parsed as typeof payload;
     }
@@ -190,9 +193,16 @@ export async function getClaudeStatus(
   // Only a parsed `loggedIn: false` means "not logged in"; anything else is a
   // failed status check and reports the real error instead of LOGIN_HINT.
   if (!payload) {
+    // JSON stdout may carry account details (email, org id): never echo it.
     const reason =
-      result.code !== 0 ? `exit code ${result.code}` : result.stdout.trim() ? "unparseable output" : "no output";
-    const tail = (result.stderr.trim() || result.stdout.trim()).slice(-500);
+      result.code !== 0
+        ? `exit code ${result.code}`
+        : parsedJson
+          ? "unexpected output (no loggedIn field)"
+          : result.stdout.trim()
+            ? "unparseable output"
+            : "no output";
+    const tail = (result.stderr.trim() || (parsedJson ? "" : result.stdout.trim())).slice(-500);
     return {
       available: true,
       loggedIn: false,
