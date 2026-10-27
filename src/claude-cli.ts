@@ -61,6 +61,10 @@ export interface RunClaudeInput {
   onEvent?: (event: AnthropicStreamEvent) => void;
   /** Pi session whose linear continuation may reuse a warm Claude process. */
   sessionId?: string;
+  /** Hold events this long (unless a content block completes first) so an early cut can be retried. Default 1500. */
+  deliveryBufferMs?: number;
+  /** First retry delay; doubles per attempt. Default 1000. */
+  retryBaseDelayMs?: number;
 }
 
 export interface RunClaudeOutput {
@@ -1006,7 +1010,10 @@ class ClaudeProcess {
           if (this.relay.denied) detail += `, native retries denied ${this.relay.denied}`;
           const upstreamError = this.relay.errorText();
           if (upstreamError) detail += `, upstream said: ${upstreamError.slice(0, 500)}`;
-          throw new IncompleteClaudeResponse(`Incomplete Claude Code upstream response (${detail})`);
+          throw new IncompleteClaudeResponse(`Incomplete Claude Code upstream response (${detail})`, {
+            status: this.relay.status,
+            upstreamError,
+          });
         }
         message = this.relay.capture.message;
         sawMessageStop = true;
@@ -1099,7 +1106,93 @@ class ClaudeProcess {
 }
 
 /** The child or relay ended without a complete response; the worker is unusable, a fresh one may succeed. */
-export class IncompleteClaudeResponse extends Error {}
+export class IncompleteClaudeResponse extends Error {
+  /** Upstream HTTP status seen by the relay, when the relay was used. */
+  readonly status?: number;
+  /** Upstream error text (HTTP error body or in-stream error event). */
+  readonly upstreamError?: string;
+
+  constructor(message: string, details: { status?: number; upstreamError?: string } = {}) {
+    super(message);
+    this.name = "IncompleteClaudeResponse";
+    this.status = details.status;
+    this.upstreamError = details.upstreamError;
+  }
+}
+
+/** Attempts allowed per failure class: 429 gets one retry; overloaded, 5xx and stream cuts get two; other 4xx none. */
+function maxAttemptsFor(error: IncompleteClaudeResponse): number {
+  const status = error.status;
+  if (status === 429 || /rate_limit_error/u.test(error.upstreamError ?? "")) return 2;
+  if (status !== undefined && status >= 400 && status < 500 && status !== 408) return 1;
+  return 3;
+}
+
+/** Hold stream events until the first complete content block (or a time limit), so an early cut stays retryable. */
+const DELIVERY_BUFFER_MS = 1_500;
+const RETRY_BASE_DELAY_MS = 1_000;
+
+class BufferedDelivery {
+  flushed = false;
+  sawToolUse = false;
+  private pending: AnthropicStreamEvent[] = [];
+  private timer?: NodeJS.Timeout;
+
+  constructor(
+    private readonly target: ((event: AnthropicStreamEvent) => void) | undefined,
+    private readonly holdMs: number,
+  ) {}
+
+  readonly onEvent = (event: AnthropicStreamEvent): void => {
+    if (event.type === "content_block_start" && event.content_block.type === "tool_use") this.sawToolUse = true;
+    if (!this.target) return;
+    if (this.flushed) {
+      this.target(event);
+      return;
+    }
+    this.pending.push(event);
+    if (event.type === "content_block_stop" || event.type === "message_stop") this.flush();
+    else if (!this.timer) {
+      this.timer = setTimeout(() => this.flush(), this.holdMs);
+      this.timer.unref?.();
+    }
+  };
+
+  flush(): void {
+    this.cancelTimer();
+    if (this.flushed || !this.target) return;
+    this.flushed = true;
+    const events = this.pending;
+    this.pending = [];
+    for (const event of events) this.target(event);
+  }
+
+  /** Drop undelivered events of a failed attempt. */
+  discard(): void {
+    this.cancelTimer();
+    this.pending = [];
+  }
+
+  private cancelTimer(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    signal?.throwIfAborted();
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal?.reason ?? new Error("Claude Code request aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 interface AcquiredProcess {
   worker: ClaudeProcess;
@@ -1209,18 +1302,29 @@ registerSessionResourceCleanup((sessionId) => {
 });
 
 export async function runClaudeRequest(input: RunClaudeInput): Promise<RunClaudeOutput> {
-  let delivered = false;
-  const once = { ...input, onEvent: input.onEvent ? (event: AnthropicStreamEvent) => ((delivered = true), input.onEvent!(event)) : undefined };
-  try {
-    return await runClaudeRequestOnce(once);
-  } catch (error) {
-    // Never retry after events reached the caller: a replay would duplicate streamed output.
-    if (!(error instanceof IncompleteClaudeResponse) || input.signal?.aborted || delivered) throw error;
-    // runClaudeRequestOnce already discarded exactly its own failed worker (child, relay, cache entry); other requests'
-    // workers are untouched. Forget cached readiness and respawn once, with a cold full replay, instead of surfacing a
-    // dead-worker error (Jean-visible loops on 2026-10-26).
-    readyStatusCache.clear();
-    return await runClaudeRequestOnce(input);
+  const baseDelay = input.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
+  for (let attempt = 1; ; attempt++) {
+    const delivery = new BufferedDelivery(input.onEvent, input.deliveryBufferMs ?? DELIVERY_BUFFER_MS);
+    try {
+      const output = await runClaudeRequestOnce({ ...input, onEvent: delivery.onEvent });
+      delivery.flush();
+      return output;
+    } catch (error) {
+      delivery.discard();
+      // Never retry after events reached the caller (a replay would duplicate streamed output), after an abort, or
+      // once a tool call started. runClaudeRequestOnce already discarded exactly its own failed worker.
+      if (!(error instanceof IncompleteClaudeResponse) || input.signal?.aborted || delivery.flushed || delivery.sawToolUse) {
+        throw error;
+      }
+      const maxAttempts = maxAttemptsFor(error);
+      if (attempt >= maxAttempts) {
+        if (attempt > 1) error.message += ` [gave up after ${attempt} attempts]`;
+        throw error;
+      }
+      // Forget cached readiness and respawn cold with a full replay (Jean-visible loops on 2026-10-26).
+      readyStatusCache.clear();
+      await sleep(baseDelay * 2 ** (attempt - 1), input.signal);
+    }
   }
 }
 

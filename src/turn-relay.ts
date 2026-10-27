@@ -95,6 +95,27 @@ export class AnthropicCapture {
   }
 }
 
+/** Name, code(s) and message of a relay failure: the name alone ("Error") hid the cause. */
+export function describeFailure(error: unknown): string {
+  if (!(error instanceof Error)) return `UnknownError${error === undefined ? "" : `: ${String(error).slice(0, 200)}`}`;
+  const inner = error instanceof AggregateError ? (error.errors as unknown[]) : [];
+  const codeOf = (value: unknown) => {
+    const code = (value as { code?: unknown } | null)?.code;
+    return typeof code === "string" || typeof code === "number" ? String(code) : undefined;
+  };
+  const codes = [...new Set([codeOf(error), ...inner.map(codeOf)].filter((code): code is string => !!code))];
+  const message =
+    error.message ||
+    inner
+      .map((value) => (value instanceof Error ? value.message : ""))
+      .filter(Boolean)
+      .join("; ");
+  let text = error.name || "Error";
+  if (codes.length) text += ` ${codes.join("/")}`;
+  if (message) text += `: ${message.slice(0, 200)}`;
+  return text;
+}
+
 interface Destroyable {
   destroy(error?: Error): void;
 }
@@ -323,7 +344,7 @@ export class TurnRelay {
       if (this.status === 200) this.capture.finish();
       response.end();
     } catch (error) {
-      this.failure = error instanceof Error ? error.name : "UnknownError";
+      this.failure = describeFailure(error);
       if (!response.headersSent) response.writeHead(this.cancelled ? 499 : 502).end();
       else response.destroy();
     } finally {

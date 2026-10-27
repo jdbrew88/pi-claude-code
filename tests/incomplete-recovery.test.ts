@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { cachedClaudeProcessCount, closeClaudeProcesses, runClaudeRequest } from "../src/claude-cli.ts";
 
@@ -22,6 +24,27 @@ for await (const line of input) {
   if (frame.shouldQuery === false) { console.log(JSON.stringify({type: "result", num_turns: 0})); continue; }
   if (frame.type !== "user") continue;
   const usage = {input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0};
+  if (process.env.MODE === "cut-first" && spawns === 1) {
+    for (const event of [
+      {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}},
+      {type: "content_block_start", index: 0, content_block: {type: "text", text: ""}},
+      {type: "content_block_delta", index: 0, delta: {type: "text_delta", text: "partial"}}]) console.log(JSON.stringify({type: "stream_event", event}));
+    console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue;
+  }
+  if (process.env.MODE === "cut-after-block") {
+    for (const event of [
+      {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}},
+      {type: "content_block_start", index: 0, content_block: {type: "text", text: ""}},
+      {type: "content_block_delta", index: 0, delta: {type: "text_delta", text: "done"}},
+      {type: "content_block_stop", index: 0}]) console.log(JSON.stringify({type: "stream_event", event}));
+    console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue;
+  }
+  if (process.env.MODE === "tool-cut") {
+    for (const event of [
+      {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}},
+      {type: "content_block_start", index: 0, content_block: {type: "tool_use", id: "t", name: "mcp__pi__x", input: {}}}]) console.log(JSON.stringify({type: "stream_event", event}));
+    console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue;
+  }
   if (process.env.MODE === "partial") {
     console.log(JSON.stringify({type: "stream_event", event: {type: "message_start", message: {id: "m", role: "assistant", content: [], usage}}}));
     console.log(JSON.stringify({type: "result", subtype: "success", is_error: false, usage})); continue;
@@ -52,7 +75,7 @@ async function setup(mode: string) {
   const log = join(root, "spawns.log"); await writeFile(log, "");
   const input = () => ({
     model: "sonnet", cwd: root, systemPrompt: "s", manifest: [], extraBody: { tools: [] }, toolNames: new Set<string>(), timeoutMs: 5_000,
-    sessionId: "loop-session", env: { PI_CLAUDE_CODE_COMMAND: exe, SPAWN_LOG: log, MODE: mode },
+    sessionId: "loop-session", retryBaseDelayMs: 5, env: { PI_CLAUDE_CODE_COMMAND: exe, SPAWN_LOG: log, MODE: mode },
     frames: [{ type: "user" as const, message: { role: "user" as const, content: [{ type: "text", text: "hi" }] } }],
   });
   const spawns = async () => (await readFile(log, "utf8")).trim().split("\n").filter(Boolean).length;
@@ -71,7 +94,7 @@ test("an incomplete response tears down the child and the next attempt respawns 
   } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
 });
 
-test("a persistently broken child fails after exactly one respawn, carries clues, and leaves no cached worker", async () => {
+test("a persistently broken child fails after three attempts, carries clues, and leaves no cached worker", async () => {
   const t = await setup("always-bad");
   try {
     for (let turn = 0; turn < 3; turn++) {
@@ -79,23 +102,120 @@ test("a persistently broken child fails after exactly one respawn, carries clues
         assert.match(error.message, /Incomplete Claude Code response/);
         assert.match(error.message, /events: .*result:success/, "event trace is in the message");
         assert.match(error.message, /relay unused/);
+        assert.match(error.message, /gave up after 3 attempts/);
         return true;
       });
       assert.equal(cachedClaudeProcessCount(), 0);
     }
-    assert.equal(await t.spawns(), 6, "2 spawns per request: one retry, no loop");
+    assert.equal(await t.spawns(), 9, "3 spawns per request: two retries, no loop");
   } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
 });
 
-test("no retry once events were streamed to the caller (a replay would duplicate output)", async () => {
+test("a cut before the first complete block is buffered, never delivered, and retried", async () => {
   const t = await setup("partial");
   try {
     const events: string[] = [];
     await assert.rejects(runClaudeRequest({ ...t.input(), onEvent: (e: { type: string }) => events.push(e.type) } as never), /Incomplete Claude Code response/);
-    assert.deepEqual(events, ["message_start"]);
+    assert.deepEqual(events, [], "buffered events of failed attempts are dropped");
+    assert.equal(await t.spawns(), 3);
+    assert.equal(cachedClaudeProcessCount(), 0);
+  } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+test("cut mid-block before flush: retried, caller sees only the good attempt's events", async () => {
+  const t = await setup("cut-first");
+  try {
+    const events: string[] = [];
+    const out = await runClaudeRequest({ ...t.input(), onEvent: (e: { type: string }) => events.push(e.type) } as never);
+    assert.equal((out.message.content[0] as { text: string }).text, "ok");
+    assert.equal(await t.spawns(), 2);
+    assert.deepEqual(events, ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]);
+  } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+test("cut after a complete block was flushed: not retried (a replay would duplicate output)", async () => {
+  const t = await setup("cut-after-block");
+  try {
+    const events: string[] = [];
+    await assert.rejects(runClaudeRequest({ ...t.input(), onEvent: (e: { type: string }) => events.push(e.type) } as never), /Incomplete Claude Code response/);
+    assert.deepEqual(events, ["message_start", "content_block_start", "content_block_delta", "content_block_stop"]);
     assert.equal(await t.spawns(), 1);
     assert.equal(cachedClaudeProcessCount(), 0);
   } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+test("buffer time limit flushes a slow first block; a later cut is then not retried", async () => {
+  const t = await setup("partial");
+  try {
+    const events: string[] = [];
+    await assert.rejects(
+      runClaudeRequest({ ...t.input(), deliveryBufferMs: 0, onEvent: (e: { type: string }) => events.push(e.type) } as never),
+      /Incomplete Claude Code response/,
+    );
+    assert.deepEqual(events, ["message_start"]);
+    assert.equal(await t.spawns(), 1);
+  } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+test("no retry once a tool_use block started", async () => {
+  const t = await setup("tool-cut");
+  try {
+    await assert.rejects(runClaudeRequest({ ...t.input(), toolNames: new Set(["x"]) }), /Incomplete Claude Code response/);
+    assert.equal(await t.spawns(), 1);
+  } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+test("no retry after abort", async () => {
+  const t = await setup("always-bad");
+  try {
+    const controller = new AbortController();
+    const run = runClaudeRequest({ ...t.input(), retryBaseDelayMs: 2_000, signal: controller.signal });
+    const until = Date.now() + 3000;
+    while ((await t.spawns()) < 1 && Date.now() < until) await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 300));
+    controller.abort();
+    await assert.rejects(run);
+    assert.equal(await t.spawns(), 1);
+  } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+async function fakeUpstream(status: number, body: object) {
+  const server = createServer((request, response) => {
+    hits += 1;
+    request.resume();
+    request.on("end", () => response.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(body)));
+  });
+  let hits = 0;
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  return { url: `http://127.0.0.1:${port}`, hits: () => hits, close: () => new Promise<void>((r) => server.close(() => r())) };
+}
+
+test("429 is retried exactly once", async () => {
+  const t = await setup("relay");
+  const upstream = await fakeUpstream(429, { type: "error", error: { type: "rate_limit_error", message: "slow down" } });
+  try {
+    await assert.rejects(runClaudeRequest({ ...t.input(), upstreamUrl: upstream.url }), (e: Error) => {
+      assert.match(e.message, /status 429/);
+      assert.match(e.message, /slow down/);
+      assert.match(e.message, /gave up after 2 attempts/);
+      return true;
+    });
+    assert.equal(await t.spawns(), 2);
+    assert.equal(upstream.hits(), 2);
+  } finally { await upstream.close(); await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
+});
+
+test("529 overloaded gets three attempts; a 400 none", async () => {
+  const t = await setup("relay");
+  const overloaded = await fakeUpstream(529, { type: "error", error: { type: "overloaded_error", message: "Overloaded" } });
+  const invalid = await fakeUpstream(400, { type: "error", error: { type: "invalid_request_error", message: "bad" } });
+  try {
+    await assert.rejects(runClaudeRequest({ ...t.input(), upstreamUrl: overloaded.url }), /status 529.*Overloaded/);
+    assert.equal(overloaded.hits(), 3);
+    await assert.rejects(runClaudeRequest({ ...t.input(), upstreamUrl: invalid.url }), /status 400/);
+    assert.equal(invalid.hits(), 1);
+  } finally { await overloaded.close(); await invalid.close(); await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
 });
 
 test("relay failure (unreachable upstream, AggregateError) is torn down and retried, not left cached", async () => {
@@ -103,10 +223,10 @@ test("relay failure (unreachable upstream, AggregateError) is torn down and retr
   try {
     // "localhost" with nothing listening: dual-stack connect failure surfaces as AggregateError in the relay.
     await assert.rejects(runClaudeRequest({ ...t.input(), upstreamUrl: "http://localhost:9" }), (e: Error) => {
-      assert.match(e.message, /Incomplete Claude Code upstream response \(status unknown, capture incomplete, relay failure (AggregateError|Error)/);
+      assert.match(e.message, /Incomplete Claude Code upstream response \(status unknown, capture incomplete, relay failure (AggregateError|Error) ECONNREFUSED/);
       return true;
     });
-    assert.equal(await t.spawns(), 2, "respawned once");
+    assert.equal(await t.spawns(), 3, "stream cut: three attempts");
     assert.equal(cachedClaudeProcessCount(), 0);
   } finally { await closeClaudeProcesses(); await rm(t.root, { recursive: true, force: true }); }
 });
