@@ -19,7 +19,7 @@ import type {
   NativeResult,
   NativeUsage,
 } from "./native-types.ts";
-import { TOOL_PREFIX, type NativeSystemInjection, type ToolManifestEntry } from "./transcript.ts";
+import { canonicalizeToolUseNames, type NativeSystemInjection, type ToolManifestEntry } from "./transcript.ts";
 
 export const INSTALL_HINT =
   "Claude Code is not installed. Install it with `npm install -g @anthropic-ai/claude-code` " +
@@ -933,9 +933,17 @@ class ClaudeProcess {
     input.signal?.throwIfAborted();
 
     let sawMessageStop = false;
+    // A throw from the consumer (e.g. the stream translator) is Pi's own failure, not an upstream cut: keep it so it
+    // surfaces as itself instead of the relay's retryable "Incomplete Claude Code upstream response".
+    let consumerError: { error: unknown } | undefined;
     const deliver = (event: AnthropicStreamEvent) => {
       if (event.type === "message_stop") sawMessageStop = true;
-      input.onEvent?.(event);
+      try {
+        input.onEvent?.(event);
+      } catch (error) {
+        consumerError ??= { error };
+        throw error;
+      }
     };
     const canonicalInitialUser = input.frames.find((frame) => frame.type === "user")?.message.content ?? [];
     this.relay.beginTurn(
@@ -1001,6 +1009,7 @@ class ClaudeProcess {
       }
       await this.relay.settled();
       input.signal?.throwIfAborted();
+      if (consumerError) throw consumerError.error;
 
       let message: NativeMessage | undefined;
       if (this.relay.used) {
@@ -1043,12 +1052,9 @@ class ClaudeProcess {
         throw new Error(`Claude Code request failed: ${result.subtype ?? "unknown result"}`);
       }
 
-      for (const block of message.content) {
-        if (block.type !== "tool_use") continue;
-        if (!block.name.startsWith(TOOL_PREFIX) || !input.toolNames.has(block.name.slice(TOOL_PREFIX.length))) {
-          throw new Error("Claude Code returned a tool outside Pi's current tool inventory");
-        }
-      }
+      // A bare or re-cased name of a Pi tool is mapped to its declared name; an unknown one is left for Pi to
+      // answer "Tool X not found" (a recoverable tool result), never a failed turn (2026-10-27 sonnet-5 sessions).
+      canonicalizeToolUseNames(message, input.toolNames);
 
       const usage = message.usage ?? result.usage;
       if (!usage || typeof usage.input_tokens !== "number" || typeof usage.output_tokens !== "number") {

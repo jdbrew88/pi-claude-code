@@ -28,7 +28,7 @@ import {
   prepareFrames,
   prepareNativeTranscript,
   prepareTools,
-  TOOL_PREFIX,
+  resolveToolName,
 } from "./transcript.ts";
 
 interface IndexedText {
@@ -141,9 +141,7 @@ function nativeContent(content: NativeContentBlock[], toolNames: Set<string>): A
         redacted: true,
       });
     } else if (block.type === "tool_use") {
-      if (!block.name.startsWith(TOOL_PREFIX)) throw new Error(`Claude Code returned unexpected tool ${block.name}`);
-      const name = block.name.slice(TOOL_PREFIX.length);
-      if (!toolNames.has(name)) throw new Error(`Claude Code returned unavailable tool ${name}`);
+      const { name } = resolveToolName(block.name, toolNames);
       converted.push({ type: "toolCall", id: block.id, name, arguments: block.input as never });
     }
   }
@@ -239,9 +237,7 @@ class EventTranslator {
       } as IndexedThinking);
       this.stream.push({ type: "thinking_start", contentIndex, partial: this.output });
     } else if (native.type === "tool_use") {
-      if (!native.name.startsWith(TOOL_PREFIX)) throw new Error(`Claude Code returned unexpected tool ${native.name}`);
-      const name = native.name.slice(TOOL_PREFIX.length);
-      if (!this.toolNames.has(name)) throw new Error(`Claude Code returned unavailable tool ${name}`);
+      const { name } = resolveToolName(native.name, this.toolNames);
       this.output.content.push({
         type: "toolCall",
         id: native.id,
