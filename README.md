@@ -69,6 +69,8 @@ These environment variables are optional:
 - `PI_CLAUDE_CODE_CONFIG_DIR`: Claude Code config directory to use. The
   extension passes it to Claude Code as `CLAUDE_CONFIG_DIR`.
 
+Spawned Claude Code processes always receive `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`, overriding inherited values, so Claude Code's automatic memory does not add duplicate context.
+
 ## Usage and billing
 
 Requests made through this extension count against your Claude subscription's

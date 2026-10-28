@@ -203,6 +203,7 @@ if (process.argv.includes("auth") && process.argv.includes("status")) {
   console.log(JSON.stringify({loggedIn: true, authMethod: "claude.ai", subscriptionType: "test"}));
   process.exit(0);
 }
+if (process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY !== "1") throw new Error("auto-memory must be disabled");
 if (process.cwd() !== process.env.EXPECTED_CWD) throw new Error(\`wrong cwd: \${process.cwd()}\`);
 if (process.env.PROCESS_LOG) appendFileSync(process.env.PROCESS_LOG, \`\${process.pid}\\n\`);
 const systemIndex = process.argv.indexOf("--system-prompt-file");
@@ -307,6 +308,7 @@ for await (const line of input) {
         PI_CLAUDE_CODE_COMMAND: executable,
         EXPECTED_CWD: workingRoot,
         EXPECTED_SYSTEM_PROMPT: "system",
+        CLAUDE_CODE_DISABLE_AUTO_MEMORY: "0",
       },
       timeoutMs: 5_000,
       onEvent: (event) => events.push(event.type),

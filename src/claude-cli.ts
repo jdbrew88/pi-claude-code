@@ -481,6 +481,7 @@ function processEnvironment(
   Object.assign(env, {
     ENABLE_TOOL_SEARCH: "false",
     CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1",
     CLAUDE_CODE_MAX_RETRIES: "0",
     DISABLE_AUTO_COMPACT: "1",
     DISABLE_COMPACT: "1",
