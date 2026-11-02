@@ -219,3 +219,28 @@ test("normalizes tool schemas and builds native generation fields", () => {
     context_management: { edits: [] },
   });
 });
+
+test("normalizes foreign tool call ids in replayed tool_use and tool_result", () => {
+  const foreign = "call_37cd|fc_05d3";
+  const assistant: AssistantMessage = {
+    role: "assistant",
+    api: "openai-responses",
+    provider: "openai",
+    model: "gpt-6.1-sol",
+    content: [{ type: "toolCall", id: foreign, name: "read", arguments: { path: "a" } }],
+    usage,
+    stopReason: "toolUse",
+    timestamp: 1,
+  };
+  const messages: Message[] = [
+    { role: "user", content: "go", timestamp: 0 },
+    assistant,
+    { role: "toolResult", toolCallId: foreign, toolName: "read", content: [{ type: "text", text: "ok" }], isError: false, timestamp: 2 },
+  ];
+  const frames = prepareFrames(messages);
+  const use = (frames[1]!.message.content as Array<{ id: string }>)[0]!;
+  const result = (frames[2]!.message.content as Array<{ tool_use_id: string }>)[0]!;
+  assert.equal(use.id, "call_37cd_fc_05d3");
+  assert.equal(result.tool_use_id, "call_37cd_fc_05d3");
+  assert.match(use.id, /^[a-zA-Z0-9_-]+$/);
+});

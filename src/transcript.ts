@@ -159,6 +159,12 @@ function toolResultContent(message: ToolResultMessage): string | unknown[] {
   );
 }
 
+// Tool ids from other providers (OpenAI `call_x|fc_y`) break Anthropic's
+// `^[a-zA-Z0-9_-]+$` rule after a mid-session model switch; same rule as pi-ai.
+export function toolUseId(id: string): string {
+  return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+}
+
 function canonicalAssistantContent(message: AssistantMessage): NativeContentBlock[] {
   const blocks: NativeContentBlock[] = [];
   for (const block of message.content) {
@@ -177,7 +183,7 @@ function canonicalAssistantContent(message: AssistantMessage): NativeContentBloc
     } else if (block.type === "toolCall") {
       blocks.push({
         type: "tool_use",
-        id: block.id,
+        id: toolUseId(block.id),
         name: `${TOOL_PREFIX}${block.name}`,
         input: clone(block.arguments) as Record<string, unknown>,
       });
@@ -224,7 +230,7 @@ export function prepareFrames(messages: Message[]): NativeFrame[] {
       blocks = [
         {
           type: "tool_result",
-          tool_use_id: message.toolCallId,
+          tool_use_id: toolUseId(message.toolCallId),
           content: toolResultContent(message),
           is_error: message.isError,
         },
